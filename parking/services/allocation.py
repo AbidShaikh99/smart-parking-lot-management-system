@@ -1,6 +1,7 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 
 from parking.models import (
@@ -14,17 +15,29 @@ from parking.models import (
 )
 
 
-def eligible_spaces(vehicle_type, requires_charging=False):
+
+def eligible_spaces(vehicle_type=None, requires_charging=False):
     """
-    Return operational spaces that match the vehicle's size
-    and charging requirements.
+    Return operational parking spaces.
+
+    If vehicle_type is provided, filter by vehicle size.
+    If vehicle_type is None, return all operational spaces
+    without applying a vehicle-size filter.
     """
     spaces = ParkingSpace.objects.filter(
         status=SpaceStatus.AVAILABLE
     )
 
+    # Apply charging filter only when requested.
     if requires_charging:
         spaces = spaces.filter(has_charger=True)
+
+    # No vehicle type means no vehicle-size restriction.
+    if vehicle_type is None:
+        return spaces.order_by(
+            "floor_number",
+            "space_id",
+        )
 
     if vehicle_type == VehicleType.MOTORCYCLE:
         allow_larger = getattr(
@@ -38,17 +51,24 @@ def eligible_spaces(vehicle_type, requires_charging=False):
         else:
             spaces = spaces.filter(size_capacity=1)
 
-        return spaces.order_by("size_capacity", "floor_number", "space_id")
-
-    if vehicle_type == VehicleType.CAR:
+    elif vehicle_type == VehicleType.CAR:
         spaces = spaces.filter(size_capacity__gte=2)
-        return spaces.order_by("size_capacity", "floor_number", "space_id")
 
-    if vehicle_type in (VehicleType.SUV, VehicleType.ELECTRIC):
-        spaces = spaces.filter(size_capacity__gte=3 if vehicle_type == VehicleType.SUV else 2)
-        return spaces.order_by("size_capacity", "floor_number", "space_id")
+    elif vehicle_type == VehicleType.SUV:
+        spaces = spaces.filter(size_capacity__gte=3)
 
-    return spaces.none()
+    elif vehicle_type == VehicleType.ELECTRIC:
+        spaces = spaces.filter(size_capacity__gte=2)
+
+    else:
+        return spaces.none()
+
+    return spaces.order_by(
+        "size_capacity",
+        "floor_number",
+        "space_id",
+    )
+
 
 
 def is_space_occupied(space):
@@ -65,6 +85,7 @@ def is_space_occupied(space):
 
 
 
+
 def is_space_reserved_for_another_vehicle(
     space,
     vehicle_id=None,
@@ -73,8 +94,11 @@ def is_space_reserved_for_another_vehicle(
     end_time=None,
 ):
     """
-    Return True when another vehicle has a confirmed reservation
-    that overlaps the requested parking time.
+    Return True if another vehicle has a confirmed reservation
+    that conflicts with the requested parking time.
+
+    For walk-in entry, protect spaces with any confirmed
+    reservation that has not ended yet.
     """
     at_time = at_time or timezone.now()
 
@@ -83,27 +107,42 @@ def is_space_reserved_for_another_vehicle(
         status=ReservationStatus.CONFIRMED,
     )
 
+    # Ignore reservations belonging to the same vehicle.
     if vehicle_id is not None:
         reservations = reservations.exclude(
             vehicle_id=vehicle_id
         )
 
     if start_time is not None and end_time is not None:
+        # Check whether a reservation overlaps the requested period.
         reservations = reservations.filter(
             start_time__lt=end_time,
             end_time__gt=start_time,
         )
     else:
+        # Walk-in: protect current and future reservations
+        # until their reserved end time.
         reservations = reservations.filter(
-            start_time__lte=at_time,
             end_time__gt=at_time,
         )
 
-    return reservations.exists()
+    for reservation in reservations.only(
+        "start_time",
+        "grace_period_minutes",
+    ).iterator():
+        arrival_deadline = reservation.start_time + timedelta(
+            minutes=reservation.grace_period_minutes
+        )
+        if reservation.start_time > at_time or at_time <= arrival_deadline:
+            return True
+
+    return False
+
+
 
 
 def get_available_spaces(
-    vehicle_type,
+    vehicle_type=None,
     requires_charging=False,
     vehicle_id=None,
     floor_number=None,
@@ -111,25 +150,32 @@ def get_available_spaces(
     end_time=None,
 ):
     """
-    Return spaces suitable for the vehicle that are operational,
-    not occupied, and not reserved during the requested time.
+    Return operational spaces that are not occupied
+    or reserved during the requested time.
     """
+
+    # This already filters by status, charging requirements,
+    # and vehicle size when a vehicle type is provided.
     spaces = eligible_spaces(
         vehicle_type=vehicle_type,
         requires_charging=requires_charging,
     )
 
+    # Apply floor filter only when provided.
     if floor_number is not None:
-        spaces = spaces.filter(floor_number=floor_number)
+        spaces = spaces.filter(
+            floor_number=floor_number
+        )
 
     available = []
 
     for space in spaces:
-        # Active parking sessions occupy a space.
+        # Exclude spaces with an active parking session.
         if is_space_occupied(space):
             continue
 
-        # Exclude spaces reserved for another vehicle.
+        # Exclude spaces reserved by another vehicle
+        # during the requested period.
         if is_space_reserved_for_another_vehicle(
             space=space,
             vehicle_id=vehicle_id,
@@ -141,6 +187,7 @@ def get_available_spaces(
         available.append(space)
 
     return available
+
 
 
 

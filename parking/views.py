@@ -11,7 +11,11 @@ from utils.responses import success_response, error_response
 from .models import (ParkingSpace,Vehicle,VehicleType,SessionStatus,SpaceStatus,ParkingSession,Reservation,ReservationStatus, Payment, PaymentStatus,ChargingSession,ChargingStatus)
 from .serializers import (ParkingSpaceSerializer,VehicleEntrySerializer,ReservationCreateSerializer,VehicleExitSerializer,ParkingTicketDetailSerializer)
 from .services.allocation import get_available_spaces, allocate_space
-from .services.reservations import create_reservation, validate_reservation_arrival
+from .services.reservations import (
+    create_reservation,
+    expire_missed_reservations,
+    validate_reservation_arrival,
+)
 from .services.fees import calculate_fee_breakdown
 from .services.payments import process_vehicle_exit
 
@@ -46,12 +50,9 @@ class ParkingSpaceListCreateView(APIView):
             status_code=status.HTTP_201_CREATED,
         )
 
-
-
 class ParkingAvailabilityView(APIView):
     def get(self, request):
         vehicle_type = request.query_params.get("vehicle_type")
-
         requires_charging_raw = request.query_params.get(
             "requires_charging", "false"
         ).lower()
@@ -62,9 +63,10 @@ class ParkingAvailabilityView(APIView):
 
         valid_types = [choice[0] for choice in VehicleType.choices]
 
-        if vehicle_type not in valid_types:
+        # Validate vehicle_type only when supplied.
+        if vehicle_type and vehicle_type not in valid_types:
             return error_response(
-                message="A valid vehicle_type query parameter is required.",
+                message="Invalid vehicle_type.",
                 errors={"vehicle_type": valid_types},
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
@@ -81,7 +83,9 @@ class ParkingAvailabilityView(APIView):
             return error_response(
                 message="Provide both start_time and end_time.",
                 errors={
-                    "start_time": "Both time parameters are required together."
+                    "start_time": (
+                        "Both time parameters are required together."
+                    )
                 },
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
@@ -105,7 +109,10 @@ class ParkingAvailabilityView(APIView):
                     status_code=status.HTTP_400_BAD_REQUEST,
                 )
 
-            if timezone.is_naive(start_time) or timezone.is_naive(end_time):
+            if (
+                timezone.is_naive(start_time)
+                or timezone.is_naive(end_time)
+            ):
                 return error_response(
                     message="Both times must include a timezone.",
                     errors={
@@ -118,14 +125,18 @@ class ParkingAvailabilityView(APIView):
             if start_time <= timezone.now():
                 return error_response(
                     message="Availability time must be in the future.",
-                    errors={"start_time": "Choose a future date and time."},
+                    errors={
+                        "start_time": "Choose a future date and time."
+                    },
                     status_code=status.HTTP_400_BAD_REQUEST,
                 )
 
             if end_time <= start_time:
                 return error_response(
                     message="end_time must be after start_time.",
-                    errors={"end_time": "Must be after start_time."},
+                    errors={
+                        "end_time": "Must be after start_time."
+                    },
                     status_code=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -133,7 +144,6 @@ class ParkingAvailabilityView(APIView):
             vehicle_type=vehicle_type,
             requires_charging=requires_charging,
             floor_number=floor_number,
-
             start_time=start_time,
             end_time=end_time,
         )
@@ -143,7 +153,6 @@ class ParkingAvailabilityView(APIView):
             data={
                 "vehicle_type": vehicle_type,
                 "floor_number": floor_number,
-
                 "requires_charging": requires_charging,
                 "start_time": (
                     start_time.isoformat() if start_time else None
@@ -161,7 +170,6 @@ class ParkingAvailabilityView(APIView):
 
 
 class VehicleEntryView(APIView):
-
     def post(self, request):
         serializer = VehicleEntrySerializer(data=request.data)
 
@@ -174,9 +182,12 @@ class VehicleEntryView(APIView):
 
         data = serializer.validated_data
 
+        reservation_id = data.get("reservation_id")
+
         try:
             with transaction.atomic():
-                vehicle, created = Vehicle.objects.get_or_create(
+                # Find or create the vehicle.
+                vehicle, _ = Vehicle.objects.get_or_create(
                     registration_number=data["registration_number"],
                     defaults={
                         "vehicle_type": data["vehicle_type"],
@@ -192,10 +203,14 @@ class VehicleEntryView(APIView):
                         status_code=status.HTTP_400_BAD_REQUEST,
                     )
 
-                vehicle = Vehicle.objects.select_for_update().get(
-                    pk=vehicle.pk
+                # Lock the vehicle row.
+                vehicle = (
+                    Vehicle.objects
+                    .select_for_update()
+                    .get(pk=vehicle.pk)
                 )
 
+                # Prevent duplicate active parking sessions.
                 active_session_exists = ParkingSession.objects.filter(
                     vehicle=vehicle,
                     status__in=[
@@ -215,11 +230,11 @@ class VehicleEntryView(APIView):
 
                 reservation = None
 
-                # Reserved entry: validate the reservation.
-                if data.get("reservation_id"):
+                if reservation_id is not None:
+                    # Validate reservation ownership and arrival time.
                     reservation, arrival_error = (
                         validate_reservation_arrival(
-                            reservation_id=data["reservation_id"],
+                            reservation_id=reservation_id,
                             vehicle=vehicle,
                         )
                     )
@@ -232,8 +247,21 @@ class VehicleEntryView(APIView):
 
                     space = reservation.parking_space
 
-                # Walk-in entry: allocate a non-reserved space.
+                    if (
+                        data["requires_charging"]
+                        and not space.has_charger
+                    ):
+                        return error_response(
+                            message=(
+                                "The reserved parking space does not "
+                                "have charging facilities."
+                            ),
+                            status_code=status.HTTP_409_CONFLICT,
+                        )
                 else:
+                    # A delayed scheduler must not leave expired reservations
+                    # protecting capacity from walk-in vehicles.
+                    expire_missed_reservations()
                     space = allocate_space(
                         vehicle=vehicle,
                         requires_charging=data["requires_charging"],
@@ -247,10 +275,32 @@ class VehicleEntryView(APIView):
                             status_code=status.HTTP_409_CONFLICT,
                         )
 
-                ticket_number = (
-                    f"TKT-{get_random_string(12).upper()}"
-                )
+                # Generate a unique ticket number.
+                ticket_number = None
 
+                for _ in range(5):
+                    candidate = (
+                        f"TKT-{get_random_string(12).upper()}"
+                    )
+
+                    if not ParkingSession.objects.filter(
+                        ticket_number=candidate
+                    ).exists():
+                        ticket_number = candidate
+                        break
+
+                if ticket_number is None:
+                    return error_response(
+                        message=(
+                            "Could not generate a unique parking "
+                            "ticket. Please retry."
+                        ),
+                        status_code=(
+                            status.HTTP_500_INTERNAL_SERVER_ERROR
+                        ),
+                    )
+
+                # Create the parking session.
                 session = ParkingSession.objects.create(
                     vehicle=vehicle,
                     parking_space=space,
@@ -260,7 +310,6 @@ class VehicleEntryView(APIView):
                     status=SessionStatus.ACTIVE,
                 )
 
-                # Mark the reservation as used after creating the session.
                 if reservation is not None:
                     reservation.status = ReservationStatus.CHECKED_IN
                     reservation.save(update_fields=["status"])
@@ -276,9 +325,7 @@ class VehicleEntryView(APIView):
                         "entry_time": session.entry_time,
                         "status": session.status,
                         "reservation_id": (
-                            reservation.pk
-                            if reservation is not None
-                            else None
+                            reservation.pk if reservation else None
                         ),
                     },
                     status_code=status.HTTP_201_CREATED,
@@ -288,10 +335,12 @@ class VehicleEntryView(APIView):
             return error_response(
                 message=(
                     "Vehicle entry could not be completed because "
-                    "of a conflicting parking session or reservation."
+                    "of a conflicting parking session or reservation. "
+                    "Please retry."
                 ),
                 status_code=status.HTTP_409_CONFLICT,
             )
+
 
 
 

@@ -34,7 +34,7 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
 
     status = serializers.ChoiceField(
         choices=SpaceStatus.choices,
-        read_only=True,
+        required=True,
     )
 
     class Meta:
@@ -49,7 +49,7 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
             "status",
             "created_at",
         ]
-        read_only_fields = ["id", "created_at", "status"]
+        read_only_fields = ["id", "created_at",]
 
     def validate_space_id(self, value):
         value = value.strip().upper()
@@ -86,14 +86,22 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
 
         return value
 
-
-
 class VehicleEntrySerializer(serializers.Serializer):
-    registration_number = serializers.CharField(max_length=20)
-    vehicle_type = serializers.ChoiceField(
-        choices=VehicleType.choices
+    registration_number = serializers.CharField(
+        max_length=20,
+        required=True,
     )
-    requires_charging = serializers.BooleanField(default=False)
+
+    vehicle_type = serializers.ChoiceField(
+        choices=VehicleType.choices,
+        required=True,
+    )
+
+    requires_charging = serializers.BooleanField(
+        default=False,
+        required=False,
+    )
+
     reservation_id = serializers.IntegerField(
         required=False,
         min_value=1,

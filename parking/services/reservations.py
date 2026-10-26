@@ -12,9 +12,14 @@ from parking.models import (
     ParkingSpace,
     SpaceStatus,
 )
-from parking.services.allocation import eligible_spaces
+from parking.services.allocation import (
+    get_available_spaces,
+    is_space_reserved_for_another_vehicle,
+    is_space_occupied,
+)
 
 
+@transaction.atomic
 def create_reservation(
     vehicle,
     start_time,
@@ -34,21 +39,19 @@ def create_reservation(
     if existing_reservation:
         return existing_reservation
 
-    candidates = eligible_spaces(
-        vehicle.vehicle_type,
+    candidates = get_available_spaces(
+        vehicle_type=vehicle.vehicle_type,
         requires_charging=requires_charging,
-    ).order_by(
-        "size_capacity",
-        "floor_number",
-        "space_id",
+        start_time=start_time,
+        end_time=end_time,
     )
 
-    for candidate_id in candidates.values_list("pk", flat=True):
+    for candidate in candidates:
         space = (
             ParkingSpace.objects
             .select_for_update()
             .filter(
-                pk=candidate_id,
+                pk=candidate.pk,
                 status=SpaceStatus.AVAILABLE,
             )
             .first()
@@ -57,25 +60,15 @@ def create_reservation(
         if space is None:
             continue
 
-        occupied = ParkingSession.objects.filter(
-            parking_space=space,
-            status__in=[
-                SessionStatus.ACTIVE,
-                SessionStatus.PAYMENT_PENDING,
-            ],
-        ).exists()
-
-        if occupied:
+        # Availability can change between listing candidates and locking one.
+        if is_space_occupied(space):
             continue
 
-        overlapping = Reservation.objects.filter(
-            parking_space=space,
-            status=ReservationStatus.CONFIRMED,
-            start_time__lt=end_time,
-            end_time__gt=start_time,
-        ).exists()
-
-        if overlapping:
+        if is_space_reserved_for_another_vehicle(
+            space=space,
+            start_time=start_time,
+            end_time=end_time,
+        ):
             continue
 
         return Reservation.objects.create(
@@ -83,30 +76,47 @@ def create_reservation(
             parking_space=space,
             start_time=start_time,
             end_time=end_time,
+            grace_period_minutes=getattr(
+                settings,
+                "PARKING_RESERVATION_GRACE_MINUTES",
+                15,
+            ),
             status=ReservationStatus.CONFIRMED,
         )
 
     return None
 
 
+
+from datetime import timedelta
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+
+from parking.models import (
+    Reservation,
+    ReservationStatus,
+    SpaceStatus,
+    SessionStatus,
+    ParkingSession,
+)
+
+
 @transaction.atomic
-def validate_reservation_arrival(
-    reservation_id,
-    vehicle,
-    now=None,
-):
+def validate_reservation_arrival(reservation_id, vehicle):
     """
-    Validate whether this vehicle can check in using its reservation.
+    Validate a reservation and its arrival window.
 
     Returns:
-        (reservation, None) when check-in is permitted.
-        (None, error_message) when check-in is not permitted.
+        (reservation, None) when arrival is permitted.
+        (None, error_message) when arrival is rejected.
     """
-    now = now or timezone.now()
 
     reservation = (
         Reservation.objects
         .select_for_update()
+        .select_related("parking_space", "vehicle")
         .filter(pk=reservation_id)
         .first()
     )
@@ -114,57 +124,79 @@ def validate_reservation_arrival(
     if reservation is None:
         return None, "Reservation not found."
 
-    if reservation.vehicle_id != vehicle.pk:
-        return None, "This reservation belongs to another vehicle."
+    if reservation.vehicle_id != vehicle.id:
+        return None, (
+            "This reservation does not belong to this vehicle."
+        )
+
+    if reservation.status == ReservationStatus.EXPIRED:
+        return None, "This reservation has expired."
 
     if reservation.status != ReservationStatus.CONFIRMED:
         return None, (
-            f"This reservation cannot be used because its status "
-            f"is {reservation.status}."
+            f"Reservation cannot be used. "
+            f"Current status: {reservation.status}."
         )
 
+    now = timezone.now()
+
+    # The early-arrival window is configurable independently of grace.
     early_minutes = getattr(
         settings,
-        "RESERVATION_EARLY_ARRIVAL_MINUTES",
+        "PARKING_RESERVATION_EARLY_ARRIVAL_MINUTES",
         15,
     )
 
-    earliest_arrival = reservation.start_time - timedelta(
-        minutes=early_minutes
+    earliest_arrival = (
+        reservation.start_time
+        - timedelta(minutes=early_minutes)
     )
 
-    latest_arrival = reservation.start_time + timedelta(
-        minutes=reservation.grace_period_minutes
+    deadline = (
+        reservation.start_time
+        + timedelta(
+            minutes=reservation.grace_period_minutes
+        )
     )
 
     if now < earliest_arrival:
-        return None, "Vehicle arrived too early for this reservation."
+        return None, (
+            "You have arrived too early for this reservation."
+        )
 
-    if now > latest_arrival:
+    if now > deadline:
         reservation.status = ReservationStatus.EXPIRED
         reservation.save(update_fields=["status"])
-        return None, "The reservation has expired because the vehicle arrived late."
 
+        return None, (
+            "Reservation expired because the arrival grace "
+            "period has ended. Please make a new reservation "
+            "or request a walk-in space."
+        )
+
+    # Ensure the reserved space is still operational.
     space = (
-        ParkingSpace.objects
+        reservation.parking_space.__class__.objects
         .select_for_update()
-        .filter(pk=reservation.parking_space_id)
-        .first()
+        .get(pk=reservation.parking_space_id)
     )
 
-    if space is None or space.status != SpaceStatus.AVAILABLE:
-        return None, "The reserved parking space is not operational."
+    if space.status != SpaceStatus.AVAILABLE:
+        return None, (
+            "The reserved parking space is not operational."
+        )
 
-    occupied = ParkingSession.objects.filter(
+    # Do not create a session if this space is already occupied.
+    if ParkingSession.objects.filter(
         parking_space=space,
         status__in=[
             SessionStatus.ACTIVE,
             SessionStatus.PAYMENT_PENDING,
         ],
-    ).exists()
-
-    if occupied:
-        return None, "The reserved parking space is currently occupied."
+    ).exists():
+        return None, (
+            "The reserved parking space is already occupied."
+        )
 
     return reservation, None
 
