@@ -64,43 +64,77 @@ def is_space_occupied(space):
     ).exists()
 
 
-def is_space_reserved_for_another_vehicle(space, vehicle_id, at_time=None):
+
+def is_space_reserved_for_another_vehicle(
+    space,
+    vehicle_id=None,
+    at_time=None,
+    start_time=None,
+    end_time=None,
+):
     """
-    Protect a space if another vehicle has a confirmed reservation
-    that has not yet ended.
+    Return True when another vehicle has a confirmed reservation
+    that overlaps the requested parking time.
     """
     at_time = at_time or timezone.now()
 
-    return Reservation.objects.filter(
+    reservations = Reservation.objects.filter(
         parking_space=space,
         status=ReservationStatus.CONFIRMED,
-        end_time__gt=at_time,
-    ).exclude(
-        vehicle_id=vehicle_id
-    ).exists()
+    )
+
+    if vehicle_id is not None:
+        reservations = reservations.exclude(
+            vehicle_id=vehicle_id
+        )
+
+    if start_time is not None and end_time is not None:
+        reservations = reservations.filter(
+            start_time__lt=end_time,
+            end_time__gt=start_time,
+        )
+    else:
+        reservations = reservations.filter(
+            start_time__lte=at_time,
+            end_time__gt=at_time,
+        )
+
+    return reservations.exists()
 
 
 def get_available_spaces(
     vehicle_type,
     requires_charging=False,
     vehicle_id=None,
+    floor_number=None,
+    start_time=None,
+    end_time=None,
 ):
     """
-    Return eligible spaces that are not occupied and are not
-    protected by another vehicle's reservation.
+    Return spaces suitable for the vehicle that are operational,
+    not occupied, and not reserved during the requested time.
     """
-    available = []
-
-    for space in eligible_spaces(
+    spaces = eligible_spaces(
         vehicle_type=vehicle_type,
         requires_charging=requires_charging,
-    ):
+    )
+
+    if floor_number is not None:
+        spaces = spaces.filter(floor_number=floor_number)
+
+    available = []
+
+    for space in spaces:
+        # Active parking sessions occupy a space.
         if is_space_occupied(space):
             continue
 
+        # Exclude spaces reserved for another vehicle.
         if is_space_reserved_for_another_vehicle(
             space=space,
             vehicle_id=vehicle_id,
+            start_time=start_time,
+            end_time=end_time,
         ):
             continue
 
@@ -109,36 +143,48 @@ def get_available_spaces(
     return available
 
 
+
 @transaction.atomic
-def allocate_space(
-    vehicle,
-    requires_charging=False,
-):
+def allocate_space(vehicle, requires_charging=False):
     """
-    Lock candidate spaces and allocate the first suitable
-    space that is still free.
+    Find and lock the first eligible parking space.
+
+    Recheck its status, active occupancy, and reservations
+    before returning it.
+
+    The caller must create the parking session inside the
+    same outer transaction.
     """
     candidates = eligible_spaces(
         vehicle_type=vehicle.vehicle_type,
         requires_charging=requires_charging,
-    ).order_by("size_capacity", "floor_number", "space_id")
+    ).order_by(
+        "size_capacity",
+        "floor_number",
+        "space_id",
+    )
 
     for candidate in candidates:
         space = (
-            ParkingSpace.objects.select_for_update()
-            .filter(pk=candidate.pk, status=SpaceStatus.AVAILABLE)
+            ParkingSpace.objects
+            .select_for_update()
+            .filter(
+                pk=candidate.pk,
+                status=SpaceStatus.AVAILABLE,
+            )
             .first()
         )
 
         if space is None:
             continue
 
+        # Check whether another active session uses this space.
         if is_space_occupied(space):
             continue
 
+        # Do not take a space reserved for another vehicle.
         if is_space_reserved_for_another_vehicle(
             space=space,
-            vehicle_id=vehicle.pk,
         ):
             continue
 

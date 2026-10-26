@@ -2,12 +2,41 @@ from rest_framework import serializers
 import re
 from django.utils import timezone
 
-from .models import (ParkingSpace, Vehicle, VehicleType,Reservation, ReservationStatus)
-
-
-
+from .models import (ParkingSpace, SpaceStatus, Vehicle, VehicleType,Reservation, ReservationStatus)
 
 class ParkingSpaceSerializer(serializers.ModelSerializer):
+    space_id = serializers.CharField(
+        max_length=30,
+        required=True,
+        allow_blank=False,
+    )
+
+    space_type = serializers.CharField(
+        max_length=20,
+        required=True,
+        allow_blank=False,
+    )
+
+    floor_number = serializers.IntegerField(
+        required=True,
+        min_value=0,
+    )
+
+    size_capacity = serializers.IntegerField(
+        required=True,
+        min_value=1,
+        max_value=3,
+    )
+
+    has_charger = serializers.BooleanField(
+        required=True,
+    )
+
+    status = serializers.ChoiceField(
+        choices=SpaceStatus.choices,
+        read_only=True,
+    )
+
     class Meta:
         model = ParkingSpace
         fields = [
@@ -20,12 +49,14 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
             "status",
             "created_at",
         ]
-        read_only_fields = ["id", "created_at"]
+        read_only_fields = ["id", "created_at", "status"]
 
     def validate_space_id(self, value):
         value = value.strip().upper()
 
-        queryset = ParkingSpace.objects.filter(space_id=value)
+        queryset = ParkingSpace.objects.filter(
+            space_id=value
+        )
 
         if self.instance:
             queryset = queryset.exclude(pk=self.instance.pk)
@@ -35,20 +66,6 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
                 "A parking space with this ID already exists."
             )
 
-        return value
-
-    def validate_floor_number(self, value):
-        if value < 0:
-            raise serializers.ValidationError(
-                "Floor number cannot be negative."
-            )
-        return value
-
-    def validate_size_capacity(self, value):
-        if value not in (1, 2, 3):
-            raise serializers.ValidationError(
-                "Size capacity must be 1, 2, or 3."
-            )
         return value
 
     def validate_space_type(self, value):
@@ -70,12 +87,17 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
         return value
 
 
+
 class VehicleEntrySerializer(serializers.Serializer):
     registration_number = serializers.CharField(max_length=20)
     vehicle_type = serializers.ChoiceField(
         choices=VehicleType.choices
     )
     requires_charging = serializers.BooleanField(default=False)
+    reservation_id = serializers.IntegerField(
+        required=False,
+        min_value=1,
+    )
 
     def validate_registration_number(self, value):
         value = value.strip().upper()
@@ -128,3 +150,40 @@ class VehicleExitSerializer(serializers.Serializer):
     ticket_number = serializers.CharField(max_length=40)
     lost_ticket = serializers.BooleanField(default=False)
     payment_success = serializers.BooleanField(default=True)
+
+
+class ParkingTicketDetailSerializer(serializers.Serializer):
+    ticket_number = serializers.CharField()
+    registration_number = serializers.CharField()
+    vehicle_type = serializers.CharField()
+    space_id = serializers.CharField()
+    floor_number = serializers.IntegerField()
+
+    entry_time = serializers.DateTimeField()
+    exit_time = serializers.DateTimeField(allow_null=True)
+
+    session_status = serializers.CharField()
+    payment_status = serializers.CharField(allow_null=True)
+
+    lost_ticket = serializers.BooleanField()
+
+    parking_fee = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )
+    charging_fee = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )
+    discount_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )
+    penalty_amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )
+    total_fee = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+    )

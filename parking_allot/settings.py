@@ -136,3 +136,5 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 #================================================
 PARKING_MOTORCYCLES_CAN_USE_LARGER_SPACES = True
+
+RESERVATION_EARLY_ARRIVAL_MINUTES = 15

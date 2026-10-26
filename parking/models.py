@@ -25,6 +25,7 @@ class SessionStatus(models.TextChoices):
 
 class ReservationStatus(models.TextChoices):
     CONFIRMED = "CONFIRMED", "Confirmed"
+    CHECKED_IN = "CHECKED_IN", "Checked In"
     CANCELLED = "CANCELLED", "Cancelled"
     EXPIRED = "EXPIRED", "Expired"
     COMPLETED = "COMPLETED", "Completed"
@@ -113,6 +114,7 @@ class ParkingSession(models.Model):
         related_name="parking_sessions",
     )
     ticket_number = models.CharField(max_length=40, unique=True)
+    reservation = models.OneToOneField("Reservation",on_delete=models.PROTECT,null=True,blank=True,related_name="parking_session")
 
     entry_time = models.DateTimeField(default=timezone.now)
     exit_time = models.DateTimeField(null=True, blank=True)
