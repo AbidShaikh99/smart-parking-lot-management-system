@@ -158,6 +158,11 @@ class VehicleExitSerializer(serializers.Serializer):
     ticket_number = serializers.CharField(max_length=40)
     lost_ticket = serializers.BooleanField(default=False)
     payment_success = serializers.BooleanField(default=True)
+    # idempotency_key = serializers.CharField(
+    #     max_length=100,
+    #     required=False,
+    #     allow_blank=False,
+    # )
 
 
 class ParkingTicketDetailSerializer(serializers.Serializer):

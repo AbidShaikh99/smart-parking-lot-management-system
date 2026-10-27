@@ -3,8 +3,8 @@ from rest_framework import serializers, status
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from decimal import Decimal
-from django.db.models import Count, Sum, Q
-from datetime import date
+from django.db.models import Count, F, OuterRef, Q, Subquery, Sum
+from datetime import date, datetime, time, timedelta
 from django.utils.crypto import get_random_string
 from django.db.models.functions import TruncDate
 from utils.responses import success_response, error_response
@@ -552,7 +552,13 @@ class ParkingFeeView(APIView):
 
 class VehicleExitView(APIView):
     def post(self, request):
-        serializer = VehicleExitSerializer(data=request.data)
+        request_data = request.data.copy()
+        if not request_data.get("idempotency_key"):
+            header_key = request.headers.get("Idempotency-Key")
+            if header_key:
+                request_data["idempotency_key"] = header_key
+
+        serializer = VehicleExitSerializer(data=request_data)
 
         if not serializer.is_valid():
             return error_response(
@@ -565,6 +571,9 @@ class VehicleExitView(APIView):
             ticket_number=serializer.validated_data["ticket_number"],
             lost_ticket=serializer.validated_data["lost_ticket"],
             payment_success=serializer.validated_data["payment_success"],
+            # idempotency_key=serializer.validated_data.get(
+            #     "idempotency_key"
+            # ),
         )
 
         if not result["success"]:
@@ -648,11 +657,17 @@ class ParkingRevenueReportView(APIView):
                 status_code=400,
             )
 
-        # 2. Validate the date format.
+        # 2. Validate exact YYYY-MM-DD values.
         try:
             start = date.fromisoformat(start_date)
             end = date.fromisoformat(end_date)
         except ValueError:
+            return error_response(
+                message="Dates must use YYYY-MM-DD format.",
+                status_code=400,
+            )
+
+        if start.isoformat() != start_date or end.isoformat() != end_date:
             return error_response(
                 message="Dates must use YYYY-MM-DD format.",
                 status_code=400,
@@ -665,18 +680,44 @@ class ParkingRevenueReportView(APIView):
                 status_code=400,
             )
 
-        # 4. Only payments that are currently successful count.
-        # REFUNDED, FAILED and PENDING payments are excluded.
+        # Count only the most recent successful record per session.
+        latest_successful_payment = (
+            Payment.objects
+            .filter(
+                parking_session_id=OuterRef("parking_session_id"),
+                status=PaymentStatus.SUCCEEDED,
+            )
+            .order_by("-created_at", "-pk")
+            .values("pk")[:1]
+        )
         payments = Payment.objects.filter(
             status=PaymentStatus.SUCCEEDED,
             created_at__date__gte=start,
             created_at__date__lte=end,
+        ).annotate(
+            latest_successful_payment_id=Subquery(
+                latest_successful_payment
+            )
+        ).filter(
+            pk=F("latest_successful_payment_id")
         )
 
-        # 5. Calculate total revenue and successful payment count.
+        # REFUNDED is a full reversal in this payment model. Report it
+        # separately and exclude it from successful revenue.
+        refunds = Payment.objects.filter(
+            status=PaymentStatus.REFUNDED,
+            updated_at__date__gte=start,
+            updated_at__date__lte=end,
+        )
+
+        # 5. Calculate net collected revenue and reversal totals.
         summary = payments.aggregate(
             total_revenue=Sum("amount"),
             successful_payment_count=Count("id"),
+        )
+        refund_summary = refunds.aggregate(
+            refunded_amount=Sum("amount"),
+            refunded_payment_count=Count("id"),
         )
 
         total_revenue = (
@@ -684,6 +725,12 @@ class ParkingRevenueReportView(APIView):
         )
 
         payment_count = summary["successful_payment_count"]
+        refunded_amount = (
+            refund_summary["refunded_amount"] or Decimal("0.00")
+        )
+        refunded_payment_count = refund_summary[
+            "refunded_payment_count"
+        ]
 
         # 6. Break down revenue by payment date.
         daily_rows = (
@@ -738,6 +785,8 @@ class ParkingRevenueReportView(APIView):
             "end_date": end.isoformat(),
             "successful_payment_count": payment_count,
             "total_revenue": str(total_revenue),
+            "refunded_payment_count": refunded_payment_count,
+            "refunded_amount": str(refunded_amount),
             "revenue_by_date": revenue_by_date,
             "revenue_by_vehicle_type": revenue_by_vehicle_type,
         }
@@ -768,6 +817,15 @@ class ParkingOccupancyReportView(APIView):
                 start = date.fromisoformat(start_date)
                 end = date.fromisoformat(end_date)
             except ValueError:
+                return error_response(
+                    message="Dates must use YYYY-MM-DD format.",
+                    status_code=400,
+                )
+
+            if (
+                start.isoformat() != start_date
+                or end.isoformat() != end_date
+            ):
                 return error_response(
                     message="Dates must use YYYY-MM-DD format.",
                     status_code=400,
@@ -900,6 +958,10 @@ class ParkingOccupancyReportView(APIView):
                 "id",
                 filter=Q(status=ReservationStatus.COMPLETED),
             ),
+            checked_in=Count(
+                "id",
+                filter=Q(status=ReservationStatus.CHECKED_IN),
+            ),
             expired=Count(
                 "id",
                 filter=Q(status=ReservationStatus.EXPIRED),
@@ -917,22 +979,105 @@ class ParkingOccupancyReportView(APIView):
         completed_reservations = (
             reservation_summary["completed"] or 0
         )
+        checked_in_reservations = (
+            reservation_summary["checked_in"] or 0
+        )
         expired_reservations = (
             reservation_summary["expired"] or 0
         )
 
         resolved_reservations = (
-            completed_reservations + expired_reservations
+            completed_reservations
+            + checked_in_reservations
+            + expired_reservations
         )
 
+        utilized_reservations = (
+            completed_reservations + checked_in_reservations
+        )
         reservation_fulfillment_percentage = (
             round(
-                completed_reservations
+                utilized_reservations
                 / resolved_reservations * 100,
                 2,
             )
             if resolved_reservations else 0.0
         )
+
+        historical_session_report = None
+        if start and end:
+            period_start = timezone.make_aware(
+                datetime.combine(start, time.min)
+            )
+            period_end = timezone.make_aware(
+                datetime.combine(end + timedelta(days=1), time.min)
+            )
+            observed_end = min(period_end, timezone.now())
+            historical_sessions = ParkingSession.objects.filter(
+                entry_time__lt=observed_end,
+                status__in=[
+                    SessionStatus.ACTIVE,
+                    SessionStatus.PAYMENT_PENDING,
+                    SessionStatus.COMPLETED,
+                ],
+            ).filter(
+                Q(exit_time__isnull=True)
+                | Q(exit_time__gt=period_start)
+            ).select_related("parking_space")
+
+            session_count = 0
+            vehicle_ids = set()
+            parking_seconds_by_floor = {}
+            sessions_by_floor = {}
+
+            if observed_end > period_start:
+                for parking_session in historical_sessions:
+                    session_count += 1
+                    vehicle_ids.add(parking_session.vehicle_id)
+                    session_start = max(
+                        parking_session.entry_time,
+                        period_start,
+                    )
+                    session_end = min(
+                        parking_session.exit_time or observed_end,
+                        observed_end,
+                    )
+                    if session_end <= session_start:
+                        continue
+
+                    floor_number = (
+                        parking_session.parking_space.floor_number
+                    )
+                    parking_seconds_by_floor[floor_number] = (
+                        parking_seconds_by_floor.get(floor_number, 0)
+                        + (session_end - session_start).total_seconds()
+                    )
+                    sessions_by_floor[floor_number] = (
+                        sessions_by_floor.get(floor_number, 0) + 1
+                    )
+
+            historical_session_report = {
+                "period_start": period_start.isoformat(),
+                "period_end": observed_end.isoformat(),
+                "session_count": session_count,
+                "vehicle_count": len(vehicle_ids),
+                "parking_hours": round(
+                    sum(parking_seconds_by_floor.values()) / 3600,
+                    2,
+                ),
+                "floor_breakdown": [
+                    {
+                        "floor_number": floor_number,
+                        "session_count": sessions_by_floor[floor_number],
+                        "parking_hours": round(
+                            parking_seconds / 3600,
+                            2,
+                        ),
+                    }
+                    for floor_number, parking_seconds
+                    in sorted(parking_seconds_by_floor.items())
+                ],
+            }
 
         # 7. Calculate current charging-space utilization.
         operational_charging_spaces = operational_spaces.filter(
@@ -999,6 +1144,7 @@ class ParkingOccupancyReportView(APIView):
             "floor_wise_occupancy": floor_report,
             "reservation_report": {
                 "completed_reservations": completed_reservations,
+                "checked_in_reservations": checked_in_reservations,
                 "expired_reservations": expired_reservations,
                 "confirmed_reservations": (
                     reservation_summary["confirmed"] or 0
@@ -1009,7 +1155,11 @@ class ParkingOccupancyReportView(APIView):
                 "reservation_fulfillment_percentage": (
                     reservation_fulfillment_percentage
                 ),
+                "reservation_utilization_percentage": (
+                    reservation_fulfillment_percentage
+                ),
             },
+            "historical_session_report": historical_session_report,
             "charging_space_report": {
                 "total_operational_charging_spaces": (
                     total_charging_spaces

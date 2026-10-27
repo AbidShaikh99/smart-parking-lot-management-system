@@ -1,5 +1,4 @@
 from decimal import Decimal, ROUND_HALF_UP
-from math import ceil
 
 from django.utils import timezone
 
@@ -14,6 +13,7 @@ ZERO = Decimal("0.00")
 ONE = Decimal("1.00")
 HOUR_SECONDS = 3600
 DAY_SECONDS = 24 * HOUR_SECONDS
+MICROSECONDS_PER_SECOND = 1_000_000
 
 
 def money(value):
@@ -73,18 +73,25 @@ def calculate_fee_breakdown(
         )
 
     # Calculate the stay duration and billable time.
-    duration_seconds = (
-        exit_time - session.entry_time
-    ).total_seconds()
+    duration = exit_time - session.entry_time
+    duration_seconds = duration.total_seconds()
+    duration_microseconds = (
+        (duration.days * DAY_SECONDS + duration.seconds)
+        * MICROSECONDS_PER_SECOND
+        + duration.microseconds
+    )
+    hour_microseconds = HOUR_SECONDS * MICROSECONDS_PER_SECOND
+    day_microseconds = DAY_SECONDS * MICROSECONDS_PER_SECOND
 
     billable_hours = max(
         1,
-        ceil(duration_seconds / HOUR_SECONDS),
+        (duration_microseconds + hour_microseconds - 1)
+        // hour_microseconds,
     )
-
     billing_days = max(
         1,
-        ceil(duration_seconds / DAY_SECONDS),
+        (duration_microseconds + day_microseconds - 1)
+        // day_microseconds,
     )
 
     entry_local = timezone.localtime(session.entry_time)
@@ -150,6 +157,13 @@ def calculate_fee_breakdown(
     parking_fee = ZERO
 
     for block_number in range(billing_days):
+        billing_period_start = session.entry_time + timezone.timedelta(
+            seconds=block_number * DAY_SECONDS
+        )
+        billing_period_end = min(
+            billing_period_start + timezone.timedelta(seconds=DAY_SECONDS),
+            exit_time,
+        )
         uncapped_amount = money(
             daily_amounts.get(block_number, ZERO)
         )
@@ -163,6 +177,8 @@ def calculate_fee_breakdown(
 
         daily_charges.append({
             "billing_block": block_number + 1,
+            "billing_period_start": billing_period_start.isoformat(),
+            "billing_period_end": billing_period_end.isoformat(),
             "uncapped_amount": str(uncapped_amount),
             "daily_maximum": str(daily_cap),
             "charged_amount": str(charged_amount),

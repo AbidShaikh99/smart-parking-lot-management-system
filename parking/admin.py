@@ -1,3 +1,6 @@
 from django.contrib import admin
 
-# Register your models here.
+from .models import ParkingHoliday, PricingRule
+
+
+admin.site.register((PricingRule, ParkingHoliday))

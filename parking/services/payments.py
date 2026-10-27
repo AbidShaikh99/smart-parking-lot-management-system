@@ -12,11 +12,47 @@ from parking.models import (
 from parking.services.fees import calculate_fee_breakdown
 
 
+def _exit_result(session, payment, idempotent_replay=False):
+    succeeded = payment.status == PaymentStatus.SUCCEEDED
+    return {
+        "success": succeeded,
+        "status_code": 200 if succeeded else 402,
+        "message": (
+            "Payment successful. Vehicle exit completed."
+            if succeeded
+            else "Payment failed. The parking session remains open."
+        ),
+        "data": {
+            "ticket_number": session.ticket_number,
+            "registration_number": session.vehicle.registration_number,
+            "space_id": session.parking_space.space_id,
+            "entry_time": session.entry_time.isoformat(),
+            "exit_time": (
+                session.exit_time.isoformat()
+                if session.exit_time
+                else None
+            ),
+            "parking_fee": str(session.parking_fee),
+            "discount_amount": str(session.discount_amount),
+            "charging_fee": str(session.charging_fee),
+            "penalty_amount": str(session.penalty_amount),
+            "total_fee": str(payment.amount),
+            "payment_id": payment.id,
+            "transaction_reference": payment.transaction_reference,
+            "payment_status": payment.status,
+            "session_status": session.status,
+            "fee_breakdown": payment.fee_breakdown,
+            # "idempotent_replay": idempotent_replay,
+        },
+    }
+
+
 @transaction.atomic
 def process_vehicle_exit(
     ticket_number,
     lost_ticket=False,
     payment_success=True,
+    idempotency_key=None,
 ):
     session = (
         ParkingSession.objects
@@ -32,6 +68,70 @@ def process_vehicle_exit(
             "status_code": 404,
             "message": "Parking ticket not found.",
         }
+
+    if idempotency_key:
+        previous_attempt = (
+            Payment.objects
+            .select_for_update()
+            .filter(idempotency_key=idempotency_key)
+            .select_related("parking_session")
+            .first()
+        )
+        if previous_attempt is not None:
+            if previous_attempt.parking_session_id != session.pk:
+                return {
+                    "success": False,
+                    "status_code": 409,
+                    "message": (
+                        "This idempotency key was already used "
+                        "for a different parking ticket."
+                    ),
+                }
+
+            effective_lost_ticket = lost_ticket or session.lost_ticket
+            if (
+                previous_attempt.fee_breakdown.get("lost_ticket")
+                != effective_lost_ticket
+            ):
+                return {
+                    "success": False,
+                    "status_code": 409,
+                    "message": (
+                        "This idempotency key was already used "
+                        "with different exit details."
+                    ),
+                }
+            return _exit_result(
+                session,
+                previous_attempt,
+                idempotent_replay=True,
+            )
+
+    successful_payment = (
+        Payment.objects
+        .filter(
+            parking_session=session,
+            status=PaymentStatus.SUCCEEDED,
+        )
+        .first()
+    )
+    if successful_payment is not None:
+        if (
+            lost_ticket or session.lost_ticket
+        ) != successful_payment.fee_breakdown.get("lost_ticket"):
+            return {
+                "success": False,
+                "status_code": 409,
+                "message": (
+                    "This parking session was already paid with "
+                    "different exit details."
+                ),
+            }
+        return _exit_result(
+            session,
+            successful_payment,
+            idempotent_replay=True,
+        )
 
     if session.status == SessionStatus.COMPLETED:
         return {
@@ -71,7 +171,9 @@ def process_vehicle_exit(
 
     payment = Payment.objects.create(
         parking_session=session,
+        idempotency_key=idempotency_key,
         amount=amount,
+        fee_breakdown=fee,
         status=(
             PaymentStatus.SUCCEEDED
             if payment_success
@@ -103,17 +205,7 @@ def process_vehicle_exit(
             "status",
         ])
 
-        return {
-            "success": False,
-            "status_code": 402,
-            "message": "Payment failed. The parking session remains open.",
-            "data": {
-                "ticket_number": session.ticket_number,
-                "payment_id": payment.id,
-                "payment_status": payment.status,
-                "total_fee": str(amount),
-            },
-        }
+        return _exit_result(session, payment)
 
     # Only successful payment completes the session.
     session.exit_time = exit_time
@@ -129,24 +221,4 @@ def process_vehicle_exit(
         "status",
     ])
 
-    return {
-        "success": True,
-        "status_code": 200,
-        "message": "Payment successful. Vehicle exit completed.",
-        "data": {
-            "ticket_number": session.ticket_number,
-            "registration_number": session.vehicle.registration_number,
-            "space_id": session.parking_space.space_id,
-            "entry_time": session.entry_time.isoformat(),
-            "exit_time": exit_time.isoformat(),
-            "parking_fee": fee["parking_fee"],
-            "discount_amount": fee["discount_amount"],
-            "charging_fee": fee["charging_fee"],
-            "penalty_amount": fee["penalty_amount"],
-            "total_fee": str(amount),
-            "payment_id": payment.id,
-            "transaction_reference": payment.transaction_reference,
-            "payment_status": payment.status,
-            "session_status": session.status,
-        },
-    }
+    return _exit_result(session, payment)
