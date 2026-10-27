@@ -73,14 +73,14 @@ class ParkingSpaceSerializer(serializers.ModelSerializer):
 
         allowed_types = {
             "MOTORCYCLE",
-            "COMPACT",
+            
             "STANDARD",
             "LARGE",
         }
 
         if value not in allowed_types:
             raise serializers.ValidationError(
-                "Space type must be MOTORCYCLE, COMPACT, "
+                "Space type must be MOTORCYCLE,"
                 "STANDARD, or LARGE."
             )
 
